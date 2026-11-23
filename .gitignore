@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.env
+.env.*
+*.xlsx
+*.ttf
+*.jpg
+*.html
+*.js
+*.css
+*_files/
