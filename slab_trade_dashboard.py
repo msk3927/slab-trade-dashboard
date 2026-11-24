@@ -1,8 +1,10 @@
-"""슬라브(HS 720712) 국가별 수출·수입 세계 지도 대시보드."""
+"""슬라브·열연/후판 국가별 수출·수입 세계 지도 대시보드."""
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import math
 import shutil
 import tempfile
@@ -17,9 +19,35 @@ FONT = "Hyundai Harmony"
 ALL = "(지도 전체)"
 FLOWS = ("Export", "Import")
 FLOW_KO = {"Export": "수출", "Import": "수입"}
+PRODUCTS = (
+    {"id": "slab", "ko": "슬라브", "en": "Slab", "patterns": ("*Kang Others - Imports and Exports*.xlsx",)},
+    {"id": "flat", "ko": "열연/후판", "en": "Hot rolled / plate", "patterns": ("Kang Flat - Imports and Exports*.xlsx",)},
+)
+SLAB_CODE = "720712"
+SLAB_DESC = "SLABS: C<0.25%"
+SLAB_DEFAULT_NAME = "Kang Others - Imports and Exports_202609 (2).xlsx"
+FLAT_DEFAULT_NAME = "Kang Flat - Imports and Exports_202609 (2).xlsx"
+FLAT_PO_CODES = (
+    "720825",
+    "720826",
+    "720827",
+    "720836",
+    "720837",
+    "720838",
+    "720839",
+    "722530",
+)
+FLAT_PLATE_CODES = (
+    "720851",
+    "720852",
+    "720853",
+    "720854",
+    "720890",
+    "722540",
+    "722599",
+)
 
 # English name -> ISO-3, latitude, longitude, Korean label.
-# Coordinates are country anchors used for flow lines.
 _ROWS = [
     ("FRANCE", "FRA", 46.6, 2.2, "프랑스"),
     ("NETHERLANDS", "NLD", 52.2, 5.3, "네덜란드"),
@@ -154,7 +182,6 @@ PIE_COLORS = ["#fff4d2", "#f0d7a2", "#e0c48a", "#d4af77", "#c4a15a", "#b8924e"]
 
 EN_FIX = {
     "U S A": "United States",
-    "SOUTH KOREA": "South Korea",
     "UNITED KINGDOM": "United Kingdom",
     "CZECH REPUBLIC": "Czech Republic",
     "IRISH REPUBLIC": "Ireland",
@@ -274,15 +301,61 @@ def norm_flow(value) -> str:
     return ""
 
 
-def find_default() -> Path | None:
-    found = [
-        path
-        for path in APP_DIR.glob("Kang Others - Imports and Exports*.xlsx")
-        if not path.name.startswith("~$")
-    ]
+def find_default(product: dict) -> Path | None:
+    pinned_name = {"slab": SLAB_DEFAULT_NAME, "flat": FLAT_DEFAULT_NAME}.get(product["id"])
+    if pinned_name:
+        pinned = APP_DIR / pinned_name
+        if pinned.is_file():
+            return pinned
+    found = []
+    for pattern in product["patterns"]:
+        found.extend(path for path in APP_DIR.glob(pattern) if not path.name.startswith("~$") and ".cache" not in path.parts)
     if not found:
         return None
+    if product["id"] == "slab":
+        named = [path for path in found if "슬라브" in path.name]
+        if named:
+            found = named
     return max(found, key=lambda path: path.stat().st_mtime)
+
+
+def saved_copy(product: dict) -> tuple[Path, str] | None:
+    """Keep the last workbook so the tab stays filled until a newer file arrives."""
+    folder = APP_DIR / ".cache"
+    folder.mkdir(exist_ok=True)
+    cached = folder / f"{product['id']}.xlsx"
+    label_path = folder / f"{product['id']}.label"
+    uploaded_flag = folder / f"{product['id']}.uploaded"
+    default = find_default(product)
+    if uploaded_flag.exists() and cached.exists() and (default is None or uploaded_flag.stat().st_mtime >= default.stat().st_mtime):
+        label = label_path.read_text(encoding="utf-8").strip() if label_path.exists() else cached.name
+        return cached, label
+    if default is None:
+        if not cached.exists():
+            return None
+        label = label_path.read_text(encoding="utf-8").strip() if label_path.exists() else cached.name
+        return cached, label
+    label_path.write_text(default.name, encoding="utf-8")
+    if default.stat().st_size > 8_000_000:
+        if (not cached.exists()) or cached.stat().st_size != default.stat().st_size:
+            shutil.copy(default, cached)
+        return default, default.name
+    shutil.copy(default, cached)
+    return cached, default.name
+
+
+def prepare_frame(frame: pd.DataFrame, product_id: str) -> pd.DataFrame:
+    if product_id == "slab":
+        code = frame["hs"].astype(str).str.strip()
+        desc = frame["desc"].astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
+        kept = frame.loc[code.eq(SLAB_CODE) & desc.eq(SLAB_DESC.upper().replace(" ", ""))].copy()
+        if kept.empty:
+            raise ValueError(tr(
+                f"{SLAB_CODE} {SLAB_DESC} 행이 없습니다. 다른 품목은 슬라브에 넣지 않습니다.",
+                f"No rows for {SLAB_CODE} {SLAB_DESC}. Other products are left out of Slab.",
+            ))
+        return kept
+    return frame
 
 
 def _pick(columns, aliases, lookup):
@@ -295,7 +368,11 @@ def _pick(columns, aliases, lookup):
 
 
 def read_trade(source) -> pd.DataFrame:
-    raw = pd.read_excel(source, engine="openpyxl")
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
+    book = pd.ExcelFile(source, engine="openpyxl")
+    sheet = 1 if len(book.sheet_names) >= 2 else 0
+    raw = pd.read_excel(book, sheet_name=sheet)
     raw.columns = [str(col).strip() for col in raw.columns]
     lookup = {col.lower(): col for col in raw.columns}
     reporter = _pick(raw.columns, ["기준국가", "reporter", "reporting country"], lookup)
@@ -346,31 +423,42 @@ def read_trade(source) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+def load_cached_frame(path: Path) -> pd.DataFrame:
+    folder = APP_DIR / ".cache"
+    folder.mkdir(exist_ok=True)
+    token = hashlib.sha1(f"{path.resolve()}|{path.stat().st_mtime_ns}".encode()).hexdigest()[:16]
+    packed = folder / f"trade_{token}.pkl"
+    if packed.exists():
+        return pd.read_pickle(packed)
+    frame = read_trade(path)
+    frame.to_pickle(packed)
+    return frame
+
+
 @st.cache_data(show_spinner=False)
 def cached_read(path_str: str, mtime: float) -> pd.DataFrame:
     del mtime
-    return read_trade(path_str)
+    return load_cached_frame(Path(path_str))
 
 
-def load_default(path: Path) -> pd.DataFrame:
+def load_default(path: Path, product_id: str) -> pd.DataFrame:
     try:
         return cached_read(str(path), path.stat().st_mtime)
     except OSError:
-        temp_path = Path(tempfile.gettempdir()) / "slab_trade_copy.xlsx"
+        temp_path = Path(tempfile.gettempdir()) / f"trade_copy_{product_id}.xlsx"
         shutil.copy(path, temp_path)
         return cached_read(str(temp_path), temp_path.stat().st_mtime)
 
 
-def reset_selection() -> None:
+def reset_selection(product_id: str) -> None:
     for flow in FLOWS:
-        st.session_state[f"slab_map_nonce_{flow}"] = st.session_state.get(f"slab_map_nonce_{flow}", 0) + 1
-        st.session_state[f"slab_table_nonce_{flow}"] = st.session_state.get(f"slab_table_nonce_{flow}", 0) + 1
-        st.session_state[f"slab_sel_{flow}"] = None
-        st.session_state[f"slab_prev_{flow}"] = None
-        st.session_state[f"slab_box_{flow}"] = ALL
+        st.session_state[f"{product_id}_map_nonce_{flow}"] = st.session_state.get(f"{product_id}_map_nonce_{flow}", 0) + 1
+        st.session_state[f"{product_id}_table_nonce_{flow}"] = st.session_state.get(f"{product_id}_table_nonce_{flow}", 0) + 1
+        st.session_state[f"{product_id}_sel_{flow}"] = None
+        st.session_state[f"{product_id}_prev_{flow}"] = None
+        st.session_state[f"{product_id}_box_{flow}"] = ALL
 
 
-@st.cache_data(show_spinner=False)
 def font_face_css() -> str:
     faces = []
     for filename, weight in (("현대하모니+L.ttf", 300), ("현대하모니+M.ttf", 500), ("현대하모니+B.ttf", 700)):
@@ -480,7 +568,53 @@ def inject_css() -> None:
           background: rgba(16,14,12,0.82);
           border-radius: 0;
         }
-        div[data-testid="stFileUploader"] label { color: #f0d7a2; }
+        div[data-testid="stFileUploader"] span[data-testid="stIconMaterial"] { display: none; }
+        div[data-testid="stElementContainer"]:has(.po-set-on) {
+          display: none !important;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.po-set-on) {
+          align-items: flex-start !important;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.po-set-on) > div[data-testid="stColumn"]:not(:first-child) {
+          margin-top: 32px;
+        }
+        div[data-testid="stElementContainer"]:has(.po-set-on) + div[data-testid="stElementContainer"] [data-testid="stMultiSelect"] div[role="group"] {
+          max-height: none !important;
+          height: auto !important;
+        }
+        div[data-testid="stElementContainer"]:has(.po-set-on) + div[data-testid="stElementContainer"] [data-testid="stMultiSelectTagsContainer"] {
+          height: auto !important;
+          max-height: none !important;
+          overflow: visible !important;
+        }
+        div[data-testid="stElementContainer"]:has(.po-set-on) + div[data-testid="stElementContainer"] [aria-label="Selected values"] {
+          display: grid !important;
+          grid-template-columns: 1fr 1fr;
+          align-items: stretch !important;
+          height: auto !important;
+          width: 100% !important;
+          gap: 6px 8px !important;
+        }
+        div[data-testid="stElementContainer"]:has(.po-set-on) + div[data-testid="stElementContainer"] [data-tag] {
+          width: 100% !important;
+          max-width: 100% !important;
+          height: auto !important;
+          min-height: 36px !important;
+          overflow: visible !important;
+          box-sizing: border-box !important;
+          align-items: center !important;
+          justify-content: space-between !important;
+          padding-top: 4px !important;
+          padding-bottom: 4px !important;
+        }
+        div[data-testid="stElementContainer"]:has(.po-set-on) + div[data-testid="stElementContainer"] [data-tag] > span {
+          display: inline !important;
+          max-width: none !important;
+          overflow: visible !important;
+          white-space: normal !important;
+          line-height: 1.25 !important;
+          text-overflow: unset !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -554,14 +688,14 @@ def table_rows(event):
     return list(rows or [])
 
 
-def on_country_change(flow: str) -> None:
-    value = st.session_state.get(f"slab_box_{flow}_{lang()}", ALL)
-    st.session_state[f"slab_box_{flow}"] = value
+def on_country_change(product_id: str, flow: str) -> None:
+    value = st.session_state.get(f"{product_id}_box_{flow}_{lang()}", ALL)
+    st.session_state[f"{product_id}_box_{flow}"] = value
     selected = None if value == ALL else value
-    st.session_state[f"slab_sel_{flow}"] = selected
-    st.session_state[f"slab_prev_{flow}"] = selected
-    st.session_state[f"slab_map_nonce_{flow}"] = st.session_state.get(f"slab_map_nonce_{flow}", 0) + 1
-    st.session_state[f"slab_table_nonce_{flow}"] = st.session_state.get(f"slab_table_nonce_{flow}", 0) + 1
+    st.session_state[f"{product_id}_sel_{flow}"] = selected
+    st.session_state[f"{product_id}_prev_{flow}"] = selected
+    st.session_state[f"{product_id}_map_nonce_{flow}"] = st.session_state.get(f"{product_id}_map_nonce_{flow}", 0) + 1
+    st.session_state[f"{product_id}_table_nonce_{flow}"] = st.session_state.get(f"{product_id}_table_nonce_{flow}", 0) + 1
 
 
 def chart_layout(fig: go.Figure, height: int, title: str, legend: bool = False) -> go.Figure:
@@ -836,64 +970,28 @@ def build_monthly(frame: pd.DataFrame, title: str) -> go.Figure:
     return chart_layout(fig, 360, title, legend=True)
 
 
-def build_donut(names: list[str], values: list[float], title: str) -> go.Figure:
-    ordered = sorted(zip(names, values), key=lambda item: item[1], reverse=True)
-    if len(ordered) > 5:
-        head = ordered[:5]
-        rest = sum(value for _, value in ordered[5:])
-        head.append(("기타", rest))
-        ordered = head
-    labels = [cname(name) for name, _ in ordered]
-    amounts = [value for _, value in ordered]
-    fig = go.Figure(
-        go.Pie(
-            labels=labels,
-            values=amounts,
-            hole=0.64,
-            sort=False,
-            marker=dict(colors=PIE_COLORS, line=dict(color="#07080c", width=2)),
-            textinfo="percent",
-            textfont=dict(color="#1a150e", size=11),
-            hovertemplate="%{label}<br>%{value:,.0f} " + tr("톤", "t") + " (%{percent})<extra></extra>",
-        )
-    )
-    center = fmt_ton(sum(amounts)) if amounts else "-"
-    fig.update_layout(
-        annotations=[
-            dict(
-                text=center,
-                x=0.5,
-                y=0.5,
-                font=dict(size=16, color="#f3d7a2", family=FONT),
-                showarrow=False,
-            )
-        ]
-    )
-    return chart_layout(fig, 340, title)
-
-
-def render_tab(frame: pd.DataFrame, flow: str) -> None:
-    sub = frame[frame["flow"] == flow]
+def render_tab(frame: pd.DataFrame, flow: str, product_id: str) -> None:
+    sub = frame[frame["flow"] == flow].copy()
     if sub.empty:
-        st.warning(tr(f"선택한 기간에 {FLOW_KO[flow]} 실적이 없습니다.", f"No {flow.lower()} volume in this period."))
+        st.info(tr("이 기간에 해당하는 실적이 없습니다.", "No volume in this period."))
         return
-
     totals = sub.groupby("reporter", as_index=False)["tonnes"].sum().sort_values("tonnes", ascending=False)
     links = sub.groupby(["reporter", "partner"], as_index=False)["tonnes"].sum()
     reporters = totals["reporter"].tolist()
     reporter_set = set(reporters)
     grand = float(totals["tonnes"].sum())
 
-    sel_key = f"slab_sel_{flow}"
-    prev_key = f"slab_prev_{flow}"
-    box_key = f"slab_box_{flow}"
-    map_nonce_key = f"slab_map_nonce_{flow}"
-    table_nonce_key = f"slab_table_nonce_{flow}"
-    row_sig_key = f"slab_row_sig_{flow}"
-    pending_key = f"slab_pending_box_{flow}"
+    sel_key = f"{product_id}_sel_{flow}"
+    prev_key = f"{product_id}_prev_{flow}"
+    box_key = f"{product_id}_box_{flow}"
+    map_nonce_key = f"{product_id}_map_nonce_{flow}"
+    table_nonce_key = f"{product_id}_table_nonce_{flow}"
+    row_sig_key = f"{product_id}_row_sig_{flow}"
+    pending_key = f"{product_id}_pending_box_{flow}"
     for key, default in (
         (sel_key, None),
         (prev_key, None),
+        (box_key, ALL),
         (map_nonce_key, 0),
         (table_nonce_key, 0),
     ):
@@ -914,7 +1012,7 @@ def render_tab(frame: pd.DataFrame, flow: str) -> None:
     if selected not in reporter_set:
         selected = None
         st.session_state[sel_key] = None
-    if box_key not in st.session_state or st.session_state[box_key] not in ([ALL] + reporters):
+    if st.session_state.get(box_key) not in ([ALL] + reporters):
         st.session_state[box_key] = selected or ALL
 
     one = links[links["reporter"] == selected] if selected else links.iloc[0:0]
@@ -934,13 +1032,13 @@ def render_tab(frame: pd.DataFrame, flow: str) -> None:
             on_select="rerun",
             selection_mode="points",
             theme=None,
-            key=f"slab_map_{flow}_{st.session_state[map_nonce_key]}",
+            key=f"{product_id}_map_{flow}_{st.session_state[map_nonce_key]}",
             config={"displayModeBar": False},
         )
         picked = country_from_points(selection_points(event), reporter_set)
         if picked and picked != st.session_state.get(prev_key):
-            st.session_state[prev_key] = picked
             st.session_state[sel_key] = picked
+            st.session_state[prev_key] = picked
             st.session_state[box_key] = picked
             st.session_state[table_nonce_key] += 1
             st.rerun()
@@ -949,7 +1047,10 @@ def render_tab(frame: pd.DataFrame, flow: str) -> None:
             "Click a country to link its partners. Thicker lines mean more volume.",
         )
         if missing:
-            note += tr(f" 위치를 특정할 수 없는 {missing}건은 표에만 있습니다.", f" {missing} rows have no map location and appear only in the list.")
+            note += tr(
+                f" 위치를 특정할 수 없는 {missing}건은 표에만 있습니다.",
+                f" {missing} rows have no map location and appear only in the list.",
+            )
         st.caption(note)
 
     with right:
@@ -963,15 +1064,16 @@ def render_tab(frame: pd.DataFrame, flow: str) -> None:
                 format_func=lambda name: tr("전체", "All") if name == ALL else cname(name),
                 key=widget_key,
                 on_change=on_country_change,
-                args=(flow,),
+                args=(product_id, flow),
             )
         with clear_col:
-            if st.button(tr("해제", "Clear"), key=f"slab_clear_{flow}", use_container_width=True):
-                st.session_state[pending_key] = ALL
+            if st.button(tr("해제", "Clear"), key=f"{product_id}_clear_{flow}", use_container_width=True):
+                st.session_state[sel_key] = None
+                st.session_state[prev_key] = None
+                st.session_state[box_key] = ALL
                 st.session_state[map_nonce_key] += 1
                 st.session_state[table_nonce_key] += 1
                 st.rerun()
-
         if selected:
             share = (sel_total / grand * 100) if grand else 0
             top_partner = cname(one.iloc[0]["partner"]) if not one.empty else "-"
@@ -1022,7 +1124,7 @@ def render_tab(frame: pd.DataFrame, flow: str) -> None:
             height=520,
             on_select="rerun",
             selection_mode="single-row",
-            key=f"slab_table_{flow}_{st.session_state[table_nonce_key]}",
+            key=f"{product_id}_table_{flow}_{st.session_state[table_nonce_key]}",
             column_config={tr("물량(톤)", "Tonnes"): st.column_config.NumberColumn(format="%,d")},
         )
         rows = table_rows(table_event)
@@ -1044,25 +1146,17 @@ def render_tab(frame: pd.DataFrame, flow: str) -> None:
         bar_values = one["tonnes"].head(12).tolist()
         bar_title = phrase(selected, flow)
         month_title = tr(f"{cname(selected)} 월별 {FLOW_KO[flow]}", f"{cname(selected)} monthly {flow.lower()}")
-        donut_names = one["partner"].tolist()
-        donut_values = [float(value) for value in one["tonnes"]]
-        donut_title = tr(f"{role} 비중", f"{role} share")
     else:
         bar_names = reporters[:12]
         bar_values = [float(value) for value in totals["tonnes"].head(12)]
         bar_title = tr(f"{role} 상위", f"Top {role.lower()}")
         month_title = tr(f"월별 {FLOW_KO[flow]}", f"Monthly {flow.lower()}")
-        donut_names = reporters
-        donut_values = [float(value) for value in totals["tonnes"]]
-        donut_title = tr(f"{role} 비중", f"{role} share")
 
-    c1, c2, c3 = st.columns([1.15, 1.05, 0.8], gap="small")
+    c1, c2 = st.columns(2, gap="small")
     with c1:
         st.plotly_chart(build_bar(bar_names, bar_values, bar_title), use_container_width=True, theme=None)
     with c2:
         st.plotly_chart(build_monthly(monthly, month_title), use_container_width=True, theme=None)
-    with c3:
-        st.plotly_chart(build_donut(donut_names, donut_values, donut_title), use_container_width=True, theme=None)
 
 
 def source_banner(frame: pd.DataFrame, label: str) -> None:
@@ -1071,8 +1165,13 @@ def source_banner(frame: pd.DataFrame, label: str) -> None:
     start = frame.sort_values(["year", "month"]).iloc[0]
     end = frame.sort_values(["year", "month"]).iloc[-1]
     codes = sorted({str(code) for code in frame["hs"].dropna().unique() if str(code)})
-    desc = " · ".join(dict.fromkeys(str(text) for text in frame["desc"].dropna() if str(text) and str(text) != "nan"))
-    hs_text = ", ".join(codes) if codes else "-"
+    descriptions = list(dict.fromkeys(str(text) for text in frame["desc"].dropna() if str(text) and str(text) != "nan"))
+    if len(codes) > 3:
+        hs_text = ", ".join(codes[:3]) + tr(f" 외 {len(codes) - 3}개", f" +{len(codes) - 3}")
+        desc = ""
+    else:
+        hs_text = ", ".join(codes) if codes else "-"
+        desc = " · ".join(descriptions)
     st.markdown(
         f"""
         <div class="stat-strip">
@@ -1088,92 +1187,162 @@ def source_banner(frame: pd.DataFrame, label: str) -> None:
     )
 
 
-def apply_period(frame: pd.DataFrame) -> pd.DataFrame:
+def apply_period(frame: pd.DataFrame, product_id: str) -> pd.DataFrame:
     years = sorted(int(year) for year in frame["year"].unique())
-    codes = sorted({str(code) for code in frame["hs"].dropna().unique() if str(code)})
-    year_key = "slab_years"
+    year_key = f"{product_id}_years"
     if year_key in st.session_state:
         kept = [year for year in st.session_state[year_key] if year in years]
         st.session_state[year_key] = kept or years
-    code_key = "slab_codes"
-    if code_key in st.session_state:
-        kept_codes = [code for code in st.session_state[code_key] if code in codes]
-        st.session_state[code_key] = kept_codes or codes
 
-    f1, f2, f3 = st.columns([1.2, 1.4, 1.4])
+    if product_id == "flat":
+        ranked = frame.groupby(["hs", "desc"], as_index=False)["tonnes"].sum()
+        ranked["_code"] = pd.to_numeric(ranked["hs"], errors="coerce")
+        ranked = ranked.sort_values(["_code", "hs", "desc"], ascending=True, na_position="last")
+        labels = []
+        lookup = {}
+        for row in ranked.itertuples(index=False):
+            label = f"{row.hs}  ·  {row.desc}"
+            if label in lookup:
+                continue
+            labels.append(label)
+            lookup[label] = (str(row.hs), str(row.desc))
+        item_key = f"{product_id}_items"
+        po_flag = f"{product_id}_apply_po"
+        plate_flag = f"{product_id}_apply_plate"
+        po_labels = [label for label in labels if lookup[label][0] in FLAT_PO_CODES]
+        plate_labels = [label for label in labels if lookup[label][0] in FLAT_PLATE_CODES]
+        if item_key not in st.session_state:
+            st.session_state[item_key] = []
+        else:
+            st.session_state[item_key] = [label for label in st.session_state[item_key] if label in lookup]
+        if st.session_state.pop(po_flag, False):
+            st.session_state[item_key] = po_labels
+        if st.session_state.pop(plate_flag, False):
+            st.session_state[item_key] = plate_labels
+        chosen = set(st.session_state.get(item_key, []))
+        set_layout = bool(chosen) and chosen in {frozenset(po_labels), frozenset(plate_labels)}
+        item_col, po_col, plate_col = st.columns([3.5, 1.05, 1.25], vertical_alignment="bottom")
+        with item_col:
+            if set_layout:
+                st.markdown('<div class="po-set-on"></div>', unsafe_allow_html=True)
+            picked = st.multiselect(
+                tr("품목 상세", "Product detail"),
+                labels,
+                key=item_key,
+                placeholder=" ",
+            )
+        with po_col:
+            if st.button(tr("열연/PO Set", "HR/PO Set"), key=f"{product_id}_po_btn", use_container_width=True):
+                st.session_state[po_flag] = True
+                st.rerun()
+        with plate_col:
+            if st.button(tr("후판/시트재 Set", "Plate/sheet Set"), key=f"{product_id}_plate_btn", use_container_width=True):
+                st.session_state[plate_flag] = True
+                st.rerun()
+        if picked:
+            selected = pd.DataFrame([lookup[label] for label in picked if label in lookup], columns=["hs", "desc"])
+            frame = frame.merge(selected, on=["hs", "desc"], how="inner")
+        else:
+            frame = frame.iloc[0:0]
+
+    f1, f2 = st.columns([1.2, 1.4])
     with f1:
         chosen_years = st.multiselect(tr("연도", "Year"), years, default=years, key=year_key)
     with f2:
-        month_span = st.slider(tr("월", "Month"), 1, 12, (1, 12), key="slab_months")
-    with f3:
-        if len(codes) > 1:
-            chosen_codes = st.multiselect("HS", codes, default=codes, key=code_key)
-        else:
-            chosen_codes = codes
-            shown = codes[0] if codes else "-"
-            st.caption(f"HS {shown}")
-    if not chosen_years:
+        month_span = st.slider(tr("월", "Month"), 1, 12, (1, 12), key=f"{product_id}_months")
+    if frame.empty or not chosen_years:
         return frame.iloc[0:0]
-    masked = frame[frame["year"].isin(chosen_years) & frame["month"].between(month_span[0], month_span[1])]
-    if chosen_codes:
-        masked = masked[masked["hs"].astype(str).isin(chosen_codes)]
-    return masked
+    return frame[frame["year"].isin(chosen_years) & frame["month"].between(month_span[0], month_span[1])]
 
 
-def load_source() -> tuple[pd.DataFrame, str]:
-    default_path = find_default()
+
+def load_source(product: dict) -> tuple[pd.DataFrame, str] | None:
+    product_id = product["id"]
+    name = tr(product["ko"], product["en"])
+    df_key, label_key, sig_key = f"{product_id}_df", f"{product_id}_label", f"{product_id}_sig"
+    saved = saved_copy(product)
     uploaded = st.file_uploader(
-        tr("동일 양식 엑셀 업로드", "Upload the same Excel layout"),
+        tr(f"{name} 새 엑셀", f"New {name} Excel"),
         type=["xlsx"],
-        key="slab_upload",
+        label_visibility="collapsed",
+        key=f"{product_id}_upload",
         help=tr(
-            "열 구성이 같으면 지도와 집계가 이 파일로 바뀝니다. 기준국가, 수출/수입, YEAR, MONTH, TARIFF_CODE, TARIFF_DESCRIPTION, 대상국가, Tonnes",
-            "Same columns replace the map: reporter, export/import, YEAR, MONTH, TARIFF_CODE, TARIFF_DESCRIPTION, partner, Tonnes",
+            "올리지 않으면 지금 저장된 자료가 그대로 보입니다. 슬라브는 720712 SLABS: C<0.25%만 집계합니다.",
+            "Leave this empty to keep the saved data. Slab uses only 720712 SLABS: C<0.25%.",
+        ) if product_id == "slab" else tr(
+            "올리지 않으면 지금 저장된 자료가 그대로 보입니다. 새 파일을 올리면 그 파일로 바뀝니다.",
+            "Leave this empty to keep the saved data. A new file replaces it.",
         ),
     )
     if uploaded is not None:
-        signature = (uploaded.name, uploaded.size)
-        if st.session_state.get("slab_sig") != signature:
+        signature = ("upload", uploaded.name, uploaded.size, "all-tariffs")
+        if st.session_state.get(sig_key) != signature:
             try:
-                frame = read_trade(uploaded)
+                payload = uploaded.getvalue()
+                frame = prepare_frame(read_trade(io.BytesIO(payload)), product_id)
+                cache_dir = APP_DIR / ".cache"
+                cache_dir.mkdir(exist_ok=True)
+                (cache_dir / f"{product_id}.xlsx").write_bytes(payload)
+                (cache_dir / f"{product_id}.label").write_text(uploaded.name, encoding="utf-8")
+                (cache_dir / f"{product_id}.uploaded").write_text(uploaded.name, encoding="utf-8")
+                st.session_state[df_key] = frame
+                st.session_state[label_key] = uploaded.name
+                st.session_state[sig_key] = signature
+                reset_selection(product_id)
             except Exception as exc:
                 st.error(tr(f"파일을 읽지 못했습니다. {exc}", f"Could not read the file. {exc}"))
-                if "slab_df" not in st.session_state:
-                    st.stop()
-                return st.session_state["slab_df"], st.session_state.get("slab_label", uploaded.name)
-            st.session_state["slab_df"] = frame
-            st.session_state["slab_label"] = uploaded.name
-            st.session_state["slab_sig"] = signature
-            reset_selection()
-        return st.session_state["slab_df"], st.session_state["slab_label"]
+    elif saved is not None:
+        saved_path, saved_label = saved
+        signature = ("saved", str(saved_path), saved_path.stat().st_mtime, "all-tariffs")
+        if df_key not in st.session_state or st.session_state.get(sig_key) != signature:
+            try:
+                st.session_state[df_key] = prepare_frame(load_default(saved_path, product_id), product_id)
+                st.session_state[label_key] = saved_label
+                st.session_state[sig_key] = signature
+            except Exception as exc:
+                st.error(tr(f"저장된 자료를 읽지 못했습니다. {exc}", f"Could not read the saved file. {exc}"))
 
-    if default_path is None:
-        st.info(tr("같은 양식의 엑셀을 올리면 대시보드가 채워집니다.", "Upload an Excel file in the same layout to fill the dashboard."))
-        st.stop()
-    signature = ("default", str(default_path), default_path.stat().st_mtime)
-    if st.session_state.get("slab_sig") != signature:
-        try:
-            frame = load_default(default_path)
-        except Exception as exc:
-            st.error(tr(f"기본 파일을 읽지 못했습니다. 엑셀이 열려 있으면 닫거나, 같은 파일을 업로드해 주세요. {exc}", f"Could not read the default file. Close it in Excel or upload a copy. {exc}"))
-            st.stop()
-        st.session_state["slab_df"] = frame
-        st.session_state["slab_label"] = default_path.name
-        st.session_state["slab_sig"] = signature
-        reset_selection()
-    return st.session_state["slab_df"], st.session_state["slab_label"]
+    if df_key in st.session_state:
+        label = st.session_state.get(label_key, name)
+        st.caption(tr(
+            "출처: ISSB monthly raw data. 새 파일을 업로드하면 반영됩니다.",
+            "Source: ISSB monthly raw data. A new upload updates the figures.",
+        ))
+        return st.session_state[df_key], label
+    st.info(tr(
+        f"{name}은 같은 양식의 엑셀을 한 번 올리면, 다음 파일을 올리기 전까지 그 내용이 유지됩니다.",
+        f"Upload one Excel file for {name}. It stays on screen until you upload a newer file.",
+    ))
+    return None
+
+
+def render_product(product: dict) -> None:
+    loaded = load_source(product)
+    if loaded is None:
+        return
+    frame, label = loaded
+    filtered = apply_period(frame, product["id"])
+    if filtered.empty:
+        st.warning(tr("선택한 품목·기간에 실적이 없습니다.", "No volume for the selected products and period."))
+        return
+    source_banner(filtered, label)
+    export_tab, import_tab = st.tabs([tr("수출", "Exports"), tr("수입", "Imports")])
+    with export_tab:
+        render_tab(filtered, "Export", product["id"])
+    with import_tab:
+        render_tab(filtered, "Import", product["id"])
 
 
 def main() -> None:
     st.set_page_config(
-        page_title=tr("슬라브 수출·수입", "Slab trade"),
+        page_title=tr("슬라브 열연 후판 국가별 수출/수입 통계", "Slab, hot-rolled and plate trade statistics"),
         page_icon="◆",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
     st.session_state.setdefault("slab_lang", "ko")
     inject_css()
-    head_lang, head_left, head_right = st.columns([0.4, 2.3, 1.2], vertical_alignment="center")
+    head_lang, head_left = st.columns([0.35, 2.6], vertical_alignment="center")
     with head_lang:
         if st.button("EN" if lang() == "ko" else "한글", key="slab_lang_btn", use_container_width=True):
             st.session_state["slab_lang"] = "en" if lang() == "ko" else "ko"
@@ -1182,23 +1351,14 @@ def main() -> None:
         st.markdown(
             f"""
             <p class="top-kicker">HYUNDAI CORPORATION</p>
-            <p class="top-title">{tr("슬라브 국가별 수출 · 수입", "Slab exports and imports")}</p>
-            <p class="top-sub">{tr("세계 지도에서 국가를 누르면 상대국과 선으로 이어집니다.", "Click a country on the map to link its partners.")}</p>
+            <p class="top-title">{tr("슬라브 열연 후판 국가별 수출/수입 통계", "Slab, hot-rolled and plate trade statistics")}</p>
             """,
             unsafe_allow_html=True,
         )
-    with head_right:
-        frame, label = load_source()
-    source_banner(frame, label)
-    filtered = apply_period(frame)
-    if filtered.empty:
-        st.warning(tr("선택한 연도·월에 실적이 없습니다.", "No volume for the selected year and month."))
-        return
-    export_tab, import_tab = st.tabs([tr("수출", "Exports"), tr("수입", "Imports")])
-    with export_tab:
-        render_tab(filtered, "Export")
-    with import_tab:
-        render_tab(filtered, "Import")
+    product_tabs = st.tabs([tr(product["ko"], product["en"]) for product in PRODUCTS])
+    for product_tab, product in zip(product_tabs, PRODUCTS):
+        with product_tab:
+            render_product(product)
     st.caption(tr(
         "물량은 각 나라의 신고치입니다. 국가별 합계를 모두 더하면 세계 순수출과 같지 않을 수 있습니다.",
         "Volumes are reported by each country. Adding them up is not the same as world net exports.",
